@@ -23,6 +23,16 @@ namespace stream {
   struct session_t;
 
   /**
+   * @brief Get the size of the largest video frame that can be sent recoverably.
+   *
+   * Larger frames are sent without FEC, or can't be sent at all.
+   *
+   * @param packetsize Video packet size of the session.
+   * @return Largest encoded frame size in bytes.
+   */
+  size_t max_video_frame_size(int packetsize);
+
+  /**
    * @brief Stream configuration shared by capture and network senders.
    */
   struct config_t {

@@ -72,8 +72,8 @@ namespace pyrowave {
     bool create_encoder(int width, int height, bool yuv444, bool hdr);
 
     /**
-     * @brief Import an external image. Ownership of NT handles passes to PyroWave, and on failure the
-     *        handle may or may not have been closed, so pass a duplicate that isn't used afterwards.
+     * @brief Import an external image. Ownership of the handle passes to PyroWave if the import succeeds,
+     *        otherwise it stays with the caller.
      *
      * @param handle OS handle (NT HANDLE or file descriptor).
      * @param handle_type Vulkan handle type of `handle`.

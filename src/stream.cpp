@@ -1168,6 +1168,26 @@ namespace stream {
   }
 
   /**
+   * @brief Check whether a clipboard message can be queued without delaying other control messages.
+   *
+   * ENet stops sending reliable messages of all channels while its reliable window is full, so
+   * clipboard data only fills part of it.
+   *
+   * @param peer Client to send to.
+   * @param size Size of the message.
+   * @return True if the message can be queued now.
+   */
+  bool has_room_for_clipboard_data(net::peer_t peer, size_t size) {
+    size_t pending = peer->reliableDataInTransit;
+    for (auto node = enet_list_begin(&peer->outgoingSendReliableCommands); node != enet_list_end(&peer->outgoingSendReliableCommands); node = enet_list_next(node)) {
+      pending += ((ENetOutgoingCommand *) node)->fragmentLength;
+    }
+
+    size_t window = (size_t) peer->packetThrottle * peer->windowSize / ENET_PEER_PACKET_THROTTLE_SCALE;
+    return pending == 0 || pending + size <= window * 3 / 4;
+  }
+
+  /**
    * @brief Send a clipboard sync message to the client.
    *
    * @param session Active streaming or pairing session for the request.
@@ -1427,11 +1447,12 @@ namespace stream {
             }
 
             if (session->control.clipboard) {
+              auto &clipboard = *session->control.clipboard;
               std::vector<uint8_t> message;
-              while (session->control.clipboard->pop_outgoing(message)) {
+              while (has_room_for_clipboard_data(session->control.peer, clipboard.next_outgoing_size()) && clipboard.pop_outgoing(message)) {
                 send_clipboard(session, message);
               }
-              clipboard_busy = clipboard_busy || session->control.clipboard->busy();
+              clipboard_busy = clipboard_busy || clipboard.busy();
             }
           }
 
@@ -1583,6 +1604,23 @@ namespace stream {
     }
   }
 
+  // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
+  constexpr auto MAX_FEC_BLOCKS = 4;
+
+  // Packets are indexed with 10 bits within a FEC block
+  constexpr size_t MAX_PACKETS_PER_FEC_BLOCK = 1023;
+
+  size_t max_video_frame_size(int packetsize) {
+    auto blocksize = packetsize + MAX_RTP_HEADER_SIZE;
+    auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
+
+    // FEC is skipped for frames that need more FEC blocks than there are, see videoBroadcastThread()
+    size_t packets_per_block = (DATA_SHARDS_MAX * 100) / (100 + config::stream.fec_percentage);
+
+    // Every FEC block is rounded up to whole packets, and the first packet holds the frame header
+    return MAX_FEC_BLOCKS * (packets_per_block - 1) * payload_blocksize - sizeof(video_short_frame_header_t);
+  }
+
   /**
    * @brief Run the broadcast video sender thread.
    *
@@ -1672,9 +1710,6 @@ namespace stream {
 
       payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
 
-      // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
-      constexpr auto MAX_FEC_BLOCKS = 4;
-
       // The max number of data shards per block is found by solving this system of equations for D:
       // D = 255 - P
       // P = D * F
@@ -1708,7 +1743,7 @@ namespace stream {
 
       // If we exceed the 10-bit FEC packet index (which means our frame exceeded 4096 packets),
       // the frame will be unrecoverable. Log an error for this case.
-      if (aligned_size / blocksize >= 1024) {
+      if (aligned_size / blocksize > MAX_PACKETS_PER_FEC_BLOCK) {
         BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << (aligned_size / blocksize) << " packets)"sv;
       }
 
@@ -1724,12 +1759,15 @@ namespace stream {
       }
 
       try {
-        // Pace the packets within a frame to the configured rate (800 Mbps by default). High bitrate
-        // codecs like PyroWave need a higher rate on fast links, since a frame can't be decoded
-        // until its last packet arrives. A rate of 0 disables pacing.
-        //                                                            Mbps                    ms     packet      byte
+        // Pace the packets within a frame to the configured rate (800 Mbps by default), but at least
+        // twice the stream's rate, so frames of high bitrate codecs like PyroWave are sent within half
+        // a frame interval. A frame can't be decoded until its last packet arrives. A rate of 0
+        // disables pacing.
+        auto stream_rate = (size_t) session->config.monitor.bitrate / 1000 * (100 + fecPercentage) / 100;
+        auto pacing_rate = std::max<size_t>(config::stream.video_pacing_rate, 2 * stream_rate);
+        //                                                            Mbps       ms     packet      byte
         size_t ratecontrol_packets_in_1ms = config::stream.video_pacing_rate > 0 ?
-                                              std::max<size_t>(1, (size_t) config::stream.video_pacing_rate * std::mega::num / 1000 / blocksize / 8) :
+                                              std::max<size_t>(1, pacing_rate * std::mega::num / 1000 / blocksize / 8) :
                                               SIZE_MAX;
 
         // Send less than 64K in a single batch.

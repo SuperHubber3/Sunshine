@@ -3412,6 +3412,9 @@ namespace video {
   }
 
   int probe_encoders() {
+    // Only a successful probe advertises PyroWave
+    active_pyrowave = false;
+
     if (!allow_encoder_probing()) {
       // Error already logged
       return -1;

@@ -1186,6 +1186,7 @@ namespace rtsp_stream {
           config.packetsize = config::stream.packetsize;
         }
       }
+      config.monitor.maxFrameSize = stream::max_video_frame_size(config.packetsize);
 
       config.monitor.height = (int) util::from_view(args.at("x-nv-video[0].clientViewportHt"sv));
       config.monitor.width = (int) util::from_view(args.at("x-nv-video[0].clientViewportWd"sv));

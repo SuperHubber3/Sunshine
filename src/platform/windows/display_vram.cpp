@@ -1424,11 +1424,24 @@ namespace platf::dxgi {
      * @return True on success.
      */
     bool init_encoder(const ::video::config_t &client_config, const ::video::sunshine_colorspace_t &colorspace) override {
+      // Capture textures aren't rotated, and PyroWave can't rotate
+      if (display->display_rotation != DXGI_MODE_ROTATION_UNSPECIFIED && display->display_rotation != DXGI_MODE_ROTATION_IDENTITY) {
+        BOOST_LOG(error) << "PyroWave doesn't support rotated displays"sv;
+        return false;
+      }
+
       width = client_config.width;
       height = client_config.height;
       yuv444 = client_config.chromaSamplingType == 1;
-      hdr = ::video::colorspace_is_hdr(colorspace);
+
+      // The client decodes what it negotiated, whatever the display shows. SDR content is placed in
+      // HDR10 at a fixed brightness.
+      hdr = client_config.dynamicRange > 0;
+
       max_frame_bytes = (size_t) client_config.bitrate * 1000 / 8 / std::max(client_config.framerate, 1);
+      if (client_config.maxFrameSize) {
+        max_frame_bytes = std::min(max_frame_bytes, client_config.maxFrameSize);
+      }
 
       BOOST_LOG(info) << "PyroWave frame budget: "sv << max_frame_bytes / 1024 << " KiB"sv;
 
@@ -1517,7 +1530,15 @@ namespace platf::dxgi {
       pyrowave::encode_input_t input {};
       input.image_index = image_index;
       input.view_format = vk_format_from_dxgi(input_format);
-      input.color_space = input_format == DXGI_FORMAT_R16G16B16A16_FLOAT ? VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      if (input_format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        input.color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      } else if (hdr) {
+        input.color_space = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
+      } else {
+        // scRGB's range for SDR is 0-1, which linear BT.709 passes through unscaled. Brighter
+        // content is clipped.
+        input.color_space = VK_COLOR_SPACE_BT709_LINEAR_EXT;
+      }
       input.acquire_value = fence_value;
 
       // encode() only returns once the GPU is done, so the next convert() can overwrite the texture
@@ -1600,10 +1621,10 @@ namespace platf::dxgi {
       image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
       image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-      // PyroWave closes the handle on a successful import. A failed import might leave it open,
-      // which leaks one handle, but closing it could double-close a recycled handle value.
+      // PyroWave only takes ownership of the handle if the import succeeds
       image_index = encoder.import_image((pyrowave_os_handle) handle, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, image_info);
       if (image_index < 0) {
+        CloseHandle(handle);
         return false;
       }
 

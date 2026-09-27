@@ -1926,6 +1926,8 @@ supported on the current platform.
         <td colspan="2">
             The rate in Mbps that the packets of a video frame are sent at. Higher values send large frames faster, which lowers latency with high bitrate codecs like PyroWave, but can overflow the buffers of slow network links.
             <br>
+            Frames are always sent at twice the stream's bitrate or more, so they're sent within half a frame interval.
+            <br>
             A value of 0 disables pacing.
         </td>
     </tr>

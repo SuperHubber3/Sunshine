@@ -1325,7 +1325,9 @@ namespace pipewire {
      */
     std::unique_ptr<platf::pyrowave_encode_device_t> make_pyrowave_encode_device() override {
 #ifdef SUNSHINE_BUILD_PYROWAVE
-      if (mem_type != platf::mem_type_e::system && n_dmabuf_infos > 0) {
+      // Same condition as ensure_stream() uses to request DMA-BUFs, PyroWave can't encode other buffers
+      if (n_dmabuf_infos > 0 && (mem_type == platf::mem_type_e::vaapi || mem_type == platf::mem_type_e::vulkan ||
+                                 (mem_type == platf::mem_type_e::cuda && display_is_nvidia))) {
         return pyrowave_linux::make_encode_device(width, height, 0, 0, -1);
       }
 #endif

@@ -115,12 +115,18 @@ namespace pyrowave_linux {
       width = client_config.width;
       height = client_config.height;
       yuv444 = client_config.chromaSamplingType == 1;
+
+      // Captures are SDR, but the client decodes what it negotiated, so SDR is placed in HDR10 then
+      hdr = client_config.dynamicRange > 0;
+
       max_frame_bytes = (size_t) client_config.bitrate * 1000 / 8 / std::max(client_config.framerate, 1);
+      if (client_config.maxFrameSize) {
+        max_frame_bytes = std::min(max_frame_bytes, client_config.maxFrameSize);
+      }
 
       BOOST_LOG(info) << "PyroWave frame budget: "sv << max_frame_bytes / 1024 << " KiB"sv;
 
-      // HDR capture isn't supported on this path
-      return encoder.create_encoder(width, height, yuv444, false);
+      return encoder.create_encoder(width, height, yuv444, hdr);
     }
 
     /**
@@ -133,8 +139,12 @@ namespace pyrowave_linux {
       auto &descriptor = (egl::img_descriptor_t &) img;
 
       // Dummy frames have no buffer, the previous (or black) frame is repeated
-      if (descriptor.sequence == 0 || descriptor.sd.fds[0] < 0) {
+      if (descriptor.sequence == 0) {
         return 0;
+      }
+      if (descriptor.sd.fds[0] < 0) {
+        BOOST_LOG(error) << "PyroWave needs DMA-BUF captures, but the capture delivered a frame in memory"sv;
+        return -1;
       }
 
       struct stat st;
@@ -156,7 +166,7 @@ namespace pyrowave_linux {
         current = -1;
         images.clear();
         encoder.destroy_encoder();
-        if (!encoder.create_encoder(width, height, yuv444, false)) {
+        if (!encoder.create_encoder(width, height, yuv444, hdr)) {
           return -1;
         }
       }
@@ -238,15 +248,23 @@ namespace pyrowave_linux {
       info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
       info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-      // Vulkan takes ownership of the fd on a successful import
       int fd = dup(sd.fds[0]);
-      if (fd < 0) {
+      struct stat buffer_st;
+      if (fd < 0 || fstat(fd, &buffer_st) < 0) {
+        if (fd >= 0) {
+          close(fd);
+        }
         return -1;
       }
 
       auto index = encoder.import_image((pyrowave_os_handle) fd, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, info, VK_QUEUE_FAMILY_FOREIGN_EXT);
       if (index < 0) {
-        close(fd);
+        // Vulkan owns the fd once the memory import succeeded, even if a later step failed. The fd is
+        // only still ours if it refers to the buffer, since its number could have been reused.
+        struct stat fd_st;
+        if (fstat(fd, &fd_st) == 0 && fd_st.st_dev == buffer_st.st_dev && fd_st.st_ino == buffer_st.st_ino) {
+          close(fd);
+        }
         BOOST_LOG(error) << "PyroWave DMA-BUF import failed (format 0x"sv << util::hex(sd.fourcc).to_string_view()
                          << ", modifier 0x"sv << util::hex(sd.modifier).to_string_view() << ')';
       }
@@ -307,6 +325,7 @@ namespace pyrowave_linux {
     int width = 0;
     int height = 0;
     bool yuv444 = false;
+    bool hdr = false;
     size_t max_frame_bytes = 0;
   };
 
