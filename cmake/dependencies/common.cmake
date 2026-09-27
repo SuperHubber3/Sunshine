@@ -99,6 +99,9 @@ include_directories(SYSTEM ${MINIUPNP_INCLUDE_DIRS})
 # ffmpeg pre-compiled binaries
 include("${CMAKE_MODULE_PATH}/dependencies/ffmpeg.cmake")
 
+# PyroWave (optional)
+include("${CMAKE_MODULE_PATH}/dependencies/pyrowave.cmake")
+
 # Opus
 # Homebrew provides opus as a dynamic library only, so disable static linking for Homebrew builds
 if(SUNSHINE_BUILD_HOMEBREW)

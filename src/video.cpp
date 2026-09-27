@@ -36,6 +36,10 @@ extern "C" {
 #include "sync.h"
 #include "video.h"
 
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  #include "pyrowave/pyrowave_encoder.h"
+#endif
+
 #ifdef _WIN32
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
@@ -168,7 +172,7 @@ namespace video {
    * @return Effective stream configuration, downgraded to SDR when HDR is unsupported.
    */
   config_t resolve_dynamic_range(const encoder_t &encoder, config_t config) {
-    if (!config.dynamicRange) {
+    if (!config.dynamicRange || config.videoFormat == VIDEO_FORMAT_ID_PYROWAVE) {
       return config;
     }
 
@@ -616,6 +620,66 @@ namespace video {
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
+  };
+
+  /**
+   * @brief PyroWave encode session. Every PyroWave frame is independently decodable,
+   *        so IDR requests and reference frame invalidation are no-ops.
+   */
+  class pyrowave_encode_session_t: public encode_session_t {
+  public:
+    /**
+     * @brief Initialize a PyroWave encode session and take ownership of its device.
+     *
+     * @param encode_device Encode device.
+     */
+    pyrowave_encode_session_t(std::unique_ptr<platf::pyrowave_encode_device_t> encode_device):
+        device(std::move(encode_device)) {
+    }
+
+    /**
+     * @brief Hand a captured image to the PyroWave encode device.
+     *
+     * @param img Image or frame object to read from or populate.
+     * @return Conversion status.
+     */
+    int convert(platf::img_t &img) override {
+      return device->convert(img);
+    }
+
+    /**
+     * @brief No-op, every frame is an intra frame.
+     */
+    void request_idr_frame() override {
+    }
+
+    /**
+     * @brief No-op, every frame is an intra frame.
+     */
+    void request_normal_frame() override {
+    }
+
+    /**
+     * @brief No-op, PyroWave frames don't reference other frames.
+     *
+     * @param first_frame First frame.
+     * @param last_frame Last frame.
+     */
+    void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
+    }
+
+    /**
+     * @brief Encode the most recently converted image.
+     *
+     * @param bitstream Receives the encoded frame.
+     * @return True on success.
+     */
+    bool encode_frame(std::vector<uint8_t> &bitstream) {
+      return device->encode_frame(bitstream);
+    }
+
+  private:
+    std::unique_ptr<platf::pyrowave_encode_device_t> device;
   };
 
   /**
@@ -1471,6 +1535,7 @@ namespace video {
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
+  bool active_pyrowave = false;  ///< Whether the most recent probe found a working PyroWave encoder.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
 
   /**
@@ -1928,6 +1993,31 @@ namespace video {
   }
 
   /**
+   * @brief Encode one frame through PyroWave and queue the resulting packet.
+   *
+   * @param frame_nr Monotonic frame index assigned by the video pipeline.
+   * @param session Active PyroWave encoder session.
+   * @param packets Output queue that receives the encoded packet.
+   * @param channel_data Platform or protocol state attached to the packet.
+   * @param frame_timestamp Capture timestamp associated with the encoded frame.
+   * @return 0 when packets are queued; nonzero when encoding fails.
+   */
+  int encode_pyrowave(int64_t frame_nr, pyrowave_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    std::vector<uint8_t> bitstream;
+    if (!session.encode_frame(bitstream)) {
+      return -1;
+    }
+
+    // Every PyroWave frame is an intra frame, so it's always flagged as IDR
+    auto packet = std::make_unique<packet_raw_generic>(std::move(bitstream), frame_nr, true);
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packets->raise(std::move(packet));
+
+    return 0;
+  }
+
+  /**
    * @brief Encode one captured frame and queue packets for transmission.
    *
    * @param frame_nr Frame nr.
@@ -1942,6 +2032,8 @@ namespace video {
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
+    } else if (auto pyrowave_session = dynamic_cast<pyrowave_encode_session_t *>(&session)) {
+      return encode_pyrowave(frame_nr, *pyrowave_session, packets, channel_data, frame_timestamp);
     }
 
     return -1;
@@ -2379,6 +2471,12 @@ namespace video {
     } else if (dynamic_cast<platf::nvenc_encode_device_t *>(encode_device.get())) {
       auto nvenc_encode_device = boost::dynamic_pointer_cast<platf::nvenc_encode_device_t>(std::move(encode_device));
       return make_nvenc_encode_session(config, std::move(nvenc_encode_device));
+    } else if (dynamic_cast<platf::pyrowave_encode_device_t *>(encode_device.get())) {
+      auto pyrowave_encode_device = boost::dynamic_pointer_cast<platf::pyrowave_encode_device_t>(std::move(encode_device));
+      if (!pyrowave_encode_device->init_encoder(config, pyrowave_encode_device->colorspace)) {
+        return nullptr;
+      }
+      return std::make_unique<pyrowave_encode_session_t>(std::move(pyrowave_encode_device));
     }
 
     return nullptr;
@@ -2577,6 +2675,26 @@ namespace video {
     std::unique_ptr<platf::encode_device_t> result;
 
     auto colorspace = colorspace_from_client_config(config, disp.is_hdr());
+
+    // PyroWave replaces the negotiated encoder for this session. It always produces full range
+    // BT.709 for SDR or BT.2020 PQ for HDR, regardless of the client's colorspace request.
+    if (config.videoFormat == VIDEO_FORMAT_ID_PYROWAVE) {
+      BOOST_LOG(info) << "Creating encoder [pyrowave] "sv << (config.chromaSamplingType == 1 ? "4:4:4"sv : "4:2:0"sv)
+                      << (colorspace_is_hdr(colorspace) ? " HDR (Rec. 2020 + SMPTE 2084 PQ)"sv : " SDR (Rec. 709)"sv);
+
+      auto pyrowave_device = disp.make_pyrowave_encode_device();
+      if (!pyrowave_device) {
+        BOOST_LOG(error) << "PyroWave is not supported by this display capture method"sv;
+        return nullptr;
+      }
+
+      colorspace.full_range = true;
+      if (!colorspace_is_hdr(colorspace)) {
+        colorspace.colorspace = colorspace_e::rec709;
+      }
+      pyrowave_device->colorspace = colorspace;
+      return pyrowave_device;
+    }
 
     platf::pix_fmt_e pix_fmt;
     if (config.chromaSamplingType == 1) {
@@ -3263,6 +3381,36 @@ namespace video {
     return true;
   }
 
+  /**
+   * @brief Check whether PyroWave can encode frames captured for the chosen encoder.
+   *
+   * @param encoder Encoder chosen by the probe, which decides the capture memory type.
+   * @return True when a PyroWave test frame was encoded successfully.
+   */
+  bool validate_pyrowave(const encoder_t &encoder) {
+#ifndef SUNSHINE_BUILD_PYROWAVE
+    return false;
+#else
+    const auto output_name {display_device::map_output_name(config::video.output_name)};
+    std::shared_ptr<platf::display_t> disp;
+
+    // PyroWave shares the capture pipeline of the chosen encoder, so it's probed with its memory type
+    config_t config {1920, 1080, 60, 6000, 200000, 1, 1, 1, VIDEO_FORMAT_ID_PYROWAVE, 0, 0, 0};
+    reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
+    if (!disp) {
+      return false;
+    }
+
+    if (validate_config(disp, encoder, config) < 0) {
+      BOOST_LOG(info) << "PyroWave encoder is not available"sv;
+      return false;
+    }
+
+    BOOST_LOG(info) << "Found PyroWave encoder (library "sv << pyrowave::library_version() << ')';
+    return true;
+#endif
+  }
+
   int probe_encoders() {
     if (!allow_encoder_probing()) {
       // Error already logged
@@ -3501,6 +3649,8 @@ namespace video {
       }
       BOOST_LOG(debug) << "ENCODER STATUS ACTIVE_AV1_MODE: "sv << active_av1_mode;
     }
+
+    active_pyrowave = config::video.pyrowave && validate_pyrowave(encoder);
 
     return 0;
   }

@@ -9,6 +9,11 @@ if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64" AND DEFINED _MINHOOK_DLL)
     install(FILES "${_MINHOOK_DLL}" DESTINATION "." COMPONENT application)
 endif()
 
+# PyroWave encoder DLL
+if(SUNSHINE_BUILD_PYROWAVE)
+    install(FILES "${PYROWAVE_DLL}" DESTINATION "." COMPONENT application)
+endif()
+
 # Adding tools
 install(TARGETS dxgi-info RUNTIME DESTINATION "tools" COMPONENT dxgi)
 install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)

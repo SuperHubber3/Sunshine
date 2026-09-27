@@ -130,6 +130,20 @@ endif()
 
 list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
 
+if(SUNSHINE_BUILD_PYROWAVE)
+    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_BUILD_PYROWAVE=1)
+    include_directories(SYSTEM "${PYROWAVE_INCLUDE_DIR}" "${PYROWAVE_VULKAN_INCLUDE_DIR}")
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES "${PYROWAVE_LIBRARY}")
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/pyrowave/pyrowave_encoder.cpp"
+            "${CMAKE_SOURCE_DIR}/src/pyrowave/pyrowave_encoder.h")
+    if(UNIX AND NOT APPLE)
+        list(APPEND PLATFORM_TARGET_FILES
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/pyrowave_linux.cpp"
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/pyrowave_linux.h")
+    endif()
+endif()
+
 set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"

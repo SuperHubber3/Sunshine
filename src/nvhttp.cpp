@@ -1201,6 +1201,11 @@ namespace nvhttp {
     if ((video::active_av1_mode == 4 || video::active_av1_mode == 5) && video::last_encoder_probe_supported_yuv444_for_codec[2]) {
       codec_mode_flags |= SCM_AV1_HIGH10_444;
     }
+
+    // PyroWave supports 4:4:4 and HDR whenever it works at all
+    if (video::active_pyrowave) {
+      codec_mode_flags |= SCM_MASK_PYROWAVE;
+    }
     return codec_mode_flags;
   }
 

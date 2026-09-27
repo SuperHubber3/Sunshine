@@ -59,7 +59,8 @@
         "refresh_rate_only": []
       },
       "max_bitrate": 0,
-      "minimum_fps_target": 0
+      "minimum_fps_target": 0,
+      "pyrowave": "enabled"
     }
   },
   {
@@ -76,7 +77,8 @@
       "lan_encryption_mode": 0,
       "wan_encryption_mode": 1,
       "ping_timeout": 10000,
-      "packetsize": 0
+      "packetsize": 0,
+      "video_pacing_rate": 800
     }
   },
   {

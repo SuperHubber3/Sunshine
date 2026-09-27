@@ -1493,6 +1493,34 @@ supported on the current platform.
     </tr>
 </table>
 
+
+### pyrowave
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Offer the PyroWave codec to clients that support it. PyroWave is an intra-only wavelet codec that encodes and decodes in well under a millisecond on the GPU.
+            <br>
+            Every frame is independently decodable, so there are no IDR frames or reference frame invalidation, but it needs very high bitrates (hundreds of Mbps) and is intended for wired local networks only.
+            <br>
+            PyroWave runs on Vulkan and shares GPU memory with the capture, so it is available with DXGI/WGC capture on Windows and with KMS or PipeWire capture on Linux.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave = disabled
+            @endcode</td>
+    </tr>
+</table>
+
 ## Network
 
 ### upnp
@@ -1859,6 +1887,32 @@ supported on the current platform.
         <td>Example</td>
         <td colspan="2">@code{}
             packetsize = 1346
+            @endcode</td>
+    </tr>
+</table>
+
+
+### video_pacing_rate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The rate in Mbps that the packets of a video frame are sent at. Higher values send large frames faster, which lowers latency with high bitrate codecs like PyroWave, but can overflow the buffers of slow network links.
+            <br>
+            A value of 0 disables pacing.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            800
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            video_pacing_rate = 2000
             @endcode</td>
     </tr>
 </table>

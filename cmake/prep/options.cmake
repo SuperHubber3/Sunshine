@@ -18,6 +18,8 @@ option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
 
 option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
 
+option(SUNSHINE_ENABLE_PYROWAVE "Enable the PyroWave encoder if the pyrowave-shared library is found." ON)
+
 if(WIN32)
     option(SUNSHINE_USE_STATIC_QT
             "Require static Qt libraries and their static third-party dependencies." ON)

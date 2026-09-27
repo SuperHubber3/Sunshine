@@ -1,5 +1,6 @@
 <script setup>
 import { ref } from 'vue'
+import Checkbox from "../../../Checkbox.vue";
 const props = defineProps({
   platform: String,
   config: Object,
@@ -21,6 +22,14 @@ const config = ref(props.config)
     <input type="number" min="0" max="1000" class="form-control" id="minimum_fps_target" placeholder="0" v-model="config.minimum_fps_target" />
     <div class="form-text">{{ $t("config.minimum_fps_target_desc") }}</div>
   </div>
+
+  <!--pyrowave-->
+  <Checkbox class="mb-3"
+            id="pyrowave"
+            locale-prefix="config"
+            v-model="config.pyrowave"
+            default="true"
+  ></Checkbox>
 </template>
 
 <style scoped>

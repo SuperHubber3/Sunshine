@@ -1656,8 +1656,13 @@ namespace stream {
       }
 
       try {
-        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+        // Pace the packets within a frame to the configured rate (800 Mbps by default). High bitrate
+        // codecs like PyroWave need a higher rate on fast links, since a frame can't be decoded
+        // until its last packet arrives. A rate of 0 disables pacing.
+        //                                                            Mbps                    ms     packet      byte
+        size_t ratecontrol_packets_in_1ms = config::stream.video_pacing_rate > 0 ?
+                                              std::max<size_t>(1, (size_t) config::stream.video_pacing_rate * std::mega::num / 1000 / blocksize / 8) :
+                                              SIZE_MAX;
 
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,

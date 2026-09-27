@@ -25,6 +25,10 @@ extern "C" {
 #include "src/logging.h"
 #include "src/nvenc/nvenc_config.h"
 #include "src/nvenc/nvenc_dynamic_factory.h"
+
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  #include "src/pyrowave/pyrowave_encoder.h"
+#endif
 #include "src/video.h"
 #include "utf_utils.h"
 
@@ -1296,6 +1300,356 @@ namespace platf::dxgi {
     platf::pix_fmt_e buffer_format = platf::pix_fmt_e::unknown;
   };
 
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  /**
+   * @brief Map a capture texture format to the equivalent Vulkan format.
+   *
+   * @param format DXGI format of the capture texture.
+   * @return Vulkan format, or VK_FORMAT_UNDEFINED if PyroWave can't sample it.
+   */
+  static VkFormat vk_format_from_dxgi(DXGI_FORMAT format) {
+    switch (format) {
+      case DXGI_FORMAT_B8G8R8A8_UNORM:
+      case DXGI_FORMAT_B8G8R8X8_UNORM:
+        return VK_FORMAT_B8G8R8A8_UNORM;
+      case DXGI_FORMAT_R8G8B8A8_UNORM:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+      case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+      case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return VK_FORMAT_R16G16B16A16_SFLOAT;
+      default:
+        return VK_FORMAT_UNDEFINED;
+    }
+  }
+
+  /**
+   * @brief PyroWave encode device.
+   *
+   * Captured frames are copied into a texture shared with Vulkan, then a shared fence is signaled.
+   * PyroWave waits on that fence on the GPU, converts RGB to YCbCr, scales, and encodes on the same
+   * adapter, so frames never leave VRAM. The copy is needed because capture textures are guarded by
+   * keyed mutexes, which PyroWave can't acquire.
+   *
+   * Aspect ratio mismatches are letterboxed by copying the capture into the middle of a texture with
+   * the client's aspect ratio. The bars are never written, so they stay black.
+   */
+  class d3d_pyrowave_encode_device_t: public platf::pyrowave_encode_device_t {
+  public:
+    /**
+     * @brief Create the D3D11 device and the PyroWave Vulkan device on the capture adapter.
+     *
+     * @param display Display being captured.
+     * @param adapter_p Adapter that owns the capture textures.
+     * @return True on success.
+     */
+    bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p) {
+      this->display = std::move(display);
+
+      D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_1;
+      auto status = D3D11CreateDevice(
+        adapter_p,
+        D3D_DRIVER_TYPE_UNKNOWN,
+        nullptr,
+        D3D11_CREATE_DEVICE_FLAGS,
+        &feature_level,
+        1,
+        D3D11_SDK_VERSION,
+        &device,
+        nullptr,
+        &device_ctx
+      );
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to create PyroWave D3D11 device [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+
+      // Shared fences need Windows 10 1703 and D3D11.4
+      status = device->QueryInterface(__uuidof(ID3D11Device5), (void **) &device5);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "PyroWave requires ID3D11Device5 [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+      status = device_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **) &device_ctx4);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "PyroWave requires ID3D11DeviceContext4 [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+
+      dxgi::dxgi_t dxgi;
+      status = device->QueryInterface(IID_IDXGIDevice, (void **) &dxgi);
+      if (SUCCEEDED(status)) {
+        dxgi->SetGPUThreadPriority(7);
+      }
+
+      DXGI_ADAPTER_DESC adapter_desc;
+      adapter_p->GetDesc(&adapter_desc);
+
+      pyrowave::device_id_t id;
+      static_assert(sizeof(adapter_desc.AdapterLuid) == sizeof(pyrowave_luid));
+      pyrowave_luid luid;
+      std::memcpy(luid.luid, &adapter_desc.AdapterLuid, sizeof(luid.luid));
+      id.luid = luid;
+      if (!encoder.create_device(id)) {
+        return false;
+      }
+
+      status = device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void **) &fence);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to create shared D3D11 fence [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+
+      HANDLE fence_handle;
+      status = fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &fence_handle);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to share D3D11 fence [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+
+      // D3D11 fences are D3D12 fences under the hood
+      if (!encoder.import_timeline((pyrowave_os_handle) fence_handle, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)) {
+        CloseHandle(fence_handle);
+        return false;
+      }
+
+      return true;
+    }
+
+    /**
+     * @brief Create the PyroWave encoder for the client stream configuration.
+     *
+     * @param client_config Client stream configuration negotiated for this session.
+     * @param colorspace Colorimetry information used for conversion or encoding.
+     * @return True on success.
+     */
+    bool init_encoder(const ::video::config_t &client_config, const ::video::sunshine_colorspace_t &colorspace) override {
+      width = client_config.width;
+      height = client_config.height;
+      yuv444 = client_config.chromaSamplingType == 1;
+      hdr = ::video::colorspace_is_hdr(colorspace);
+      max_frame_bytes = (size_t) client_config.bitrate * 1000 / 8 / std::max(client_config.framerate, 1);
+
+      BOOST_LOG(info) << "PyroWave frame budget: "sv << max_frame_bytes / 1024 << " KiB"sv;
+
+      // Start with a black BGRA frame until the first capture arrives
+      return create_input(DXGI_FORMAT_B8G8R8A8_UNORM);
+    }
+
+    /**
+     * @brief Copy a captured frame into the texture shared with PyroWave.
+     *
+     * @param img_base D3D image supplied by the capture backend.
+     * @return Conversion status.
+     */
+    int convert(platf::img_t &img_base) override {
+      auto &img = (img_d3d_t &) img_base;
+
+      // Blank frames keep the previous contents, dummy frames are black
+      if (img.blank || img.dummy) {
+        return 0;
+      }
+
+      // The capture format is only known after the first real frame, and it's the same afterwards
+      if (img.format != input_format && !create_input(img.format)) {
+        return -1;
+      }
+
+      for (auto it = img_ctx_map.begin(); it != img_ctx_map.end();) {
+        if (it->second.img_weak.expired()) {
+          it = img_ctx_map.erase(it);
+        } else {
+          it++;
+        }
+      }
+
+      auto &img_ctx = img_ctx_map[img.id];
+      if (!img_ctx.texture || img_ctx.capture_texture_p != img.capture_texture.get()) {
+        img_ctx = {};
+
+        device1_t device1;
+        auto status = device->QueryInterface(__uuidof(ID3D11Device1), (void **) &device1);
+        if (FAILED(status)) {
+          return -1;
+        }
+
+        status = device1->OpenSharedResource1(img.encoder_texture_handle, __uuidof(ID3D11Texture2D), (void **) &img_ctx.texture);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Failed to open shared image texture [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
+
+        status = img_ctx.texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &img_ctx.mutex);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Failed to query IDXGIKeyedMutex [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
+
+        img_ctx.capture_texture_p = img.capture_texture.get();
+        img_ctx.img_weak = img.weak_from_this();
+      }
+
+      auto status = img_ctx.mutex->AcquireSync(0, INFINITE);
+      if (status != S_OK) {
+        BOOST_LOG(error) << "Failed to acquire capture texture mutex [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      D3D11_BOX box {0, 0, 0, (UINT) std::min(img.width, input_width - offset_x), (UINT) std::min(img.height, input_height - offset_y), 1};
+      device_ctx->CopySubresourceRegion(input_texture.get(), 0, offset_x, offset_y, 0, img_ctx.texture.get(), 0, &box);
+
+      img_ctx.mutex->ReleaseSync(0);
+
+      // PyroWave waits for this value on the GPU before it samples the texture
+      device_ctx4->Signal(fence.get(), ++fence_value);
+      device_ctx->Flush();
+
+      return 0;
+    }
+
+    /**
+     * @brief Encode the most recently converted image.
+     *
+     * @param bitstream Receives the encoded frame.
+     * @return True on success.
+     */
+    bool encode_frame(std::vector<uint8_t> &bitstream) override {
+      pyrowave::encode_input_t input {};
+      input.image_index = image_index;
+      input.view_format = vk_format_from_dxgi(input_format);
+      input.color_space = input_format == DXGI_FORMAT_R16G16B16A16_FLOAT ? VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      input.acquire_value = fence_value;
+
+      // encode() only returns once the GPU is done, so the next convert() can overwrite the texture
+      return encoder.encode(input, max_frame_bytes, bitstream);
+    }
+
+  private:
+    /**
+     * @brief (Re)create the shared input texture and the encoder for a capture format.
+     *
+     * @param format DXGI format of the captured frames.
+     * @return True on success.
+     */
+    bool create_input(DXGI_FORMAT format) {
+      auto vk_format = vk_format_from_dxgi(format);
+      if (vk_format == VK_FORMAT_UNDEFINED) {
+        BOOST_LOG(error) << "PyroWave can't encode capture format "sv << dxgi_format_to_string(format);
+        return false;
+      }
+
+      // The encoder caches views of its input, so it's recreated along with the texture
+      encoder.destroy_encoder();
+      input_texture.reset();
+      image_index = -1;
+
+      if (!encoder.create_encoder(width, height, yuv444, hdr)) {
+        return false;
+      }
+
+      // Pad the capture to the client's aspect ratio so scaling preserves it
+      input_width = std::max(display->width, (int) std::ceil((double) display->height * width / height));
+      input_height = std::max(display->height, (int) std::ceil((double) display->width * height / width));
+      offset_x = (input_width - display->width) / 2;
+      offset_y = (input_height - display->height) / 2;
+
+      D3D11_TEXTURE2D_DESC desc {};
+      desc.Width = input_width;
+      desc.Height = input_height;
+      desc.MipLevels = 1;
+      desc.ArraySize = 1;
+      desc.Format = format;
+      desc.SampleDesc.Count = 1;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+      desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+      // Zero-filled so the letterbox bars and the frames before the first capture are black
+      std::vector<uint8_t> zeros((size_t) input_width * input_height * (format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4));
+      D3D11_SUBRESOURCE_DATA init {zeros.data(), (UINT) (zeros.size() / input_height), 0};
+
+      auto status = device->CreateTexture2D(&desc, &init, &input_texture);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to create PyroWave input texture [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+
+      resource1_t resource;
+      status = input_texture->QueryInterface(__uuidof(IDXGIResource1), (void **) &resource);
+      if (FAILED(status)) {
+        return false;
+      }
+
+      HANDLE handle;
+      status = resource->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to share PyroWave input texture [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+
+      VkImageCreateInfo info {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      info.imageType = VK_IMAGE_TYPE_2D;
+      info.format = vk_format;
+      info.extent = {(uint32_t) input_width, (uint32_t) input_height, 1};
+      info.mipLevels = 1;
+      info.arrayLayers = 1;
+      info.samples = VK_SAMPLE_COUNT_1_BIT;
+      info.tiling = VK_IMAGE_TILING_OPTIMAL;
+      info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+      // PyroWave closes the handle on a successful import. A failed import might leave it open,
+      // which leaks one handle, but closing it could double-close a recycled handle value.
+      image_index = encoder.import_image((pyrowave_os_handle) handle, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, info);
+      if (image_index < 0) {
+        return false;
+      }
+
+      input_format = format;
+      BOOST_LOG(info) << "PyroWave input: "sv << dxgi_format_to_string(format) << ' ' << input_width << 'x' << input_height
+                      << " -> "sv << width << 'x' << height << (yuv444 ? " 4:4:4"sv : " 4:2:0"sv) << (hdr ? " HDR"sv : " SDR"sv);
+      return true;
+    }
+
+    /**
+     * @brief Capture texture opened on our device, cached per capture image.
+     */
+    struct img_ctx_t {
+      texture2d_t::const_pointer capture_texture_p = nullptr;  ///< Detects when the capture texture changes.
+      texture2d_t texture;  ///< Capture texture opened on the PyroWave D3D11 device.
+      keyed_mutex_t mutex;  ///< Keyed mutex shared with the capture code.
+      std::weak_ptr<const platf::img_t> img_weak;  ///< Captured image lifetime tracked for cache cleanup.
+    };
+
+    std::shared_ptr<platf::display_t> display;
+    device_t device;
+    device_ctx_t device_ctx;
+    util::safe_ptr<ID3D11Device5, Release<ID3D11Device5>> device5;
+    util::safe_ptr<ID3D11DeviceContext4, Release<ID3D11DeviceContext4>> device_ctx4;
+    util::safe_ptr<ID3D11Fence, Release<ID3D11Fence>> fence;
+    uint64_t fence_value = 0;
+
+    texture2d_t input_texture;
+    DXGI_FORMAT input_format = DXGI_FORMAT_UNKNOWN;
+    int input_width = 0;
+    int input_height = 0;
+    int offset_x = 0;
+    int offset_y = 0;
+    std::unordered_map<uint32_t, img_ctx_t> img_ctx_map;
+
+    // Declared last so the encoder is destroyed before the D3D11 resources it imported
+    pyrowave::encoder encoder;
+    int image_index = -1;
+    int width = 0;
+    int height = 0;
+    bool yuv444 = false;
+    bool hdr = false;
+    size_t max_frame_bytes = 0;
+  };
+#endif
+
   /**
    * @brief Set cursor texture.
    *
@@ -2136,6 +2490,21 @@ namespace platf::dxgi {
       return nullptr;
     }
     return device;
+  }
+
+  /**
+   * @memberof platf::dxgi::display_vram_t
+   */
+  std::unique_ptr<pyrowave_encode_device_t> display_vram_t::make_pyrowave_encode_device() {
+#ifdef SUNSHINE_BUILD_PYROWAVE
+    auto device = std::make_unique<d3d_pyrowave_encode_device_t>();
+    if (!device->init_device(shared_from_this(), adapter.get())) {
+      return nullptr;
+    }
+    return device;
+#else
+    return nullptr;
+#endif
   }
 
   /**

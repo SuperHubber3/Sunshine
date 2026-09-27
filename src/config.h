@@ -219,6 +219,7 @@ namespace config {
 
     int max_bitrate;  ///< Maximum bitrate ceiling in kbps for bitrate requested from the client.
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
+    bool pyrowave;  ///< Offer the intra-only PyroWave codec to clients that support it.
   };
 
   /**
@@ -260,6 +261,8 @@ namespace config {
 
     // Limit the packetsize to avoid fragmentation on a low MTU link
     int packetsize;  ///< Maximum payload size for network packets.
+
+    int video_pacing_rate;  ///< Rate in Mbps that video packets are paced to within a frame, 0 = unpaced.
   };
 
   /**

@@ -174,5 +174,12 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
       <div class="form-text">{{ $t('config.packetsize_desc') }}</div>
     </div>
 
+    <!-- Video Pacing Rate -->
+    <div class="mb-3">
+      <label for="video_pacing_rate" class="form-label">{{ $t('config.video_pacing_rate') }}</label>
+      <input type="number" min="0" max="100000" class="form-control" id="video_pacing_rate" placeholder="800" v-model="config.video_pacing_rate" />
+      <div class="form-text">{{ $t('config.video_pacing_rate_desc') }}</div>
+    </div>
+
   </div>
 </template>

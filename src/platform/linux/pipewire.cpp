@@ -21,6 +21,9 @@
 #include "src/platform/common.h"
 #include "src/video.h"
 #include "vaapi.h"
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  #include "pyrowave_linux.h"
+#endif
 #include "vulkan_encode.h"
 #include "wayland.h"
 
@@ -1313,6 +1316,20 @@ namespace pipewire {
 #endif
 
       return std::make_unique<platf::avcodec_encode_device_t>();
+    }
+
+    /**
+     * @brief Create PyroWave encode device.
+     *
+     * @return Constructed PyroWave encode device object, or nullptr if the capture doesn't use DMA-BUFs.
+     */
+    std::unique_ptr<platf::pyrowave_encode_device_t> make_pyrowave_encode_device() override {
+#ifdef SUNSHINE_BUILD_PYROWAVE
+      if (mem_type != platf::mem_type_e::system && n_dmabuf_infos > 0) {
+        return pyrowave_linux::make_encode_device(width, height, 0, 0, -1);
+      }
+#endif
+      return nullptr;
     }
 
     /**

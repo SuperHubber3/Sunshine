@@ -1290,6 +1290,13 @@ namespace rtsp_stream {
       return;
     }
 
+    if (config.monitor.videoFormat == video::VIDEO_FORMAT_ID_PYROWAVE && !video::active_pyrowave) {
+      BOOST_LOG(warning) << "PyroWave is unavailable, yet the client requested PyroWave"sv;
+
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+
     // Check that any required encryption is enabled
     auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
     if (encryption_mode == config::ENCRYPTION_MODE_MANDATORY && (config.encryptionFlagsEnabled & (SS_ENC_VIDEO | SS_ENC_AUDIO)) != (SS_ENC_VIDEO | SS_ENC_AUDIO)) {

@@ -30,6 +30,9 @@
 #include "src/utility.h"
 #include "src/video.h"
 #include "vaapi.h"
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  #include "pyrowave_linux.h"
+#endif
 #include "vulkan_encode.h"
 #include "wayland.h"
 
@@ -1903,6 +1906,19 @@ namespace platf {
 
         BOOST_LOG(error) << "Unsupported pixel format for egl::display_vram_t: "sv << platf::from_pix_fmt(pix_fmt);
         return nullptr;
+      }
+
+      /**
+       * @brief Create PyroWave encode device.
+       *
+       * @return Constructed PyroWave encode device object, or nullptr if unsupported.
+       */
+      std::unique_ptr<pyrowave_encode_device_t> make_pyrowave_encode_device() override {
+#ifdef SUNSHINE_BUILD_PYROWAVE
+        return pyrowave_linux::make_encode_device(width, height, img_offset_x, img_offset_y, card.render_fd.el);
+#else
+        return nullptr;
+#endif
       }
 
       /**
