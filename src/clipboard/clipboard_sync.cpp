@@ -8,6 +8,8 @@
 // standard includes
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -190,10 +192,73 @@ namespace clipboard_sync {
     }
 
     /**
+     * @brief Check that a string is valid UTF-8, which received paths must be to be converted.
+     */
+    bool is_valid_utf8(std::string_view s) {
+      for (size_t i = 0; i < s.size();) {
+        auto c = (unsigned char) s[i];
+        if (c < 0x80) {
+          i++;
+          continue;
+        }
+
+        // Number of continuation bytes
+        size_t n = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+        if (n == 0 || c > 0xF4 || s.size() - i <= n) {
+          return false;
+        }
+
+        uint32_t code_point = c & (0x3F >> n);
+        for (size_t k = 1; k <= n; k++) {
+          auto cc = (unsigned char) s[i + k];
+          if ((cc & 0xC0) != 0x80) {
+            return false;
+          }
+          code_point = (code_point << 6) | (cc & 0x3F);
+        }
+
+        // Overlong encodings, surrogates and values past the end of Unicode
+        constexpr uint32_t min_code_point[] = {0, 0x80, 0x800, 0x10000};
+        if (code_point < min_code_point[n] || code_point > 0x10FFFF || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
+          return false;
+        }
+        i += n + 1;
+      }
+      return true;
+    }
+
+#ifdef _WIN32
+    /**
+     * @brief Check whether a file name refers to a device on Windows, which it does with any extension.
+     */
+    bool is_reserved_windows_name(std::string_view name) {
+      auto base = name.substr(0, name.find('.'));
+      while (!base.empty() && base.back() == ' ') {
+        base.remove_suffix(1);
+      }
+
+      std::string upper;
+      for (char c : base) {
+        upper += (char) std::toupper((unsigned char) c);
+      }
+      if (upper == "CON" || upper == "PRN" || upper == "AUX" || upper == "NUL" || upper == "CONIN$" || upper == "CONOUT$") {
+        return true;
+      }
+
+      // COM and LPT followed by a digit or a superscript digit
+      if (upper.compare(0, 3, "COM") == 0 || upper.compare(0, 3, "LPT") == 0) {
+        auto number = std::string_view(upper).substr(3);
+        return (number.size() == 1 && std::isdigit((unsigned char) number[0])) || number == "\xc2\xb9" || number == "\xc2\xb2" || number == "\xc2\xb3";
+      }
+      return false;
+    }
+#endif
+
+    /**
      * @brief Check that a received path can't escape the directory it's extracted to.
      */
     bool is_safe_relative_path(const std::string &path) {
-      if (path.empty() || path.size() > 4096 || path.front() == '/' || path.back() == '/') {
+      if (path.empty() || path.size() > 4096 || path.front() == '/' || path.back() == '/' || !is_valid_utf8(path)) {
         return false;
       }
 
@@ -220,6 +285,12 @@ namespace clipboard_sync {
         if (component.back() == '.' || component.back() == ' ') {
           return false;
         }
+
+#ifdef _WIN32
+        if (is_reserved_windows_name(component)) {
+          return false;
+        }
+#endif
 
         start = end + 1;
       }
@@ -316,6 +387,12 @@ namespace clipboard_sync {
       thread.join();
     }
 
+    bool busy() const {
+      // The remote side usually sends its next request right after a range was served
+      auto since_served = std::chrono::steady_clock::now().time_since_epoch() - std::chrono::steady_clock::duration(last_served.load());
+      return unfinished_events > 0 || fetch_active || since_served < std::chrono::milliseconds(250);
+    }
+
     struct hello_event_t {};
 
     struct message_event_t {
@@ -333,12 +410,14 @@ namespace clipboard_sync {
         std::lock_guard lg(mutex);
         // Only the latest local change matters, and a burst of them shouldn't pile up
         if (std::holds_alternative<local_event_t>(event)) {
-          events.erase(std::remove_if(events.begin(), events.end(), [](const event_t &e) {
-                         return std::holds_alternative<local_event_t>(e);
-                       }),
-                       events.end());
+          auto it = std::remove_if(events.begin(), events.end(), [](const event_t &e) {
+            return std::holds_alternative<local_event_t>(e);
+          });
+          unfinished_events -= events.end() - it;
+          events.erase(it, events.end());
         }
         events.push_back(std::move(event));
+        unfinished_events++;
       }
       cv.notify_one();
     }
@@ -355,16 +434,43 @@ namespace clipboard_sync {
       }
     }
 
-    void run() {
-      // Remove files received by earlier sessions
-      std::error_code ec;
-      if (fs::is_directory(cache_dir, ec)) {
-        for (auto &entry : fs::directory_iterator(cache_dir, ec)) {
-          if (path_to_utf8(entry.path().filename()).rfind("clip-", 0) == 0) {
-            fs::remove_all(entry.path(), ec);
+    /**
+     * @brief Run work with the desktop user's access rights, and contain its errors.
+     */
+    void run_work(const std::function<void()> &work) {
+      auto guarded = [&]() {
+        try {
+          work();
+        } catch (const std::exception &e) {
+          // Malformed remote data or unusual local files must not take the process down
+          log(log_level_e::error, std::string("unexpected error: ") + e.what());
+          try {
+            cancel_fetch();
+          } catch (const std::exception &) {
           }
         }
+      };
+
+      if (callbacks.run_as_user) {
+        callbacks.run_as_user(guarded);
+      } else {
+        guarded();
       }
+    }
+
+    void run() {
+      // Remove files received by earlier sessions
+      run_work([this]() {
+        std::error_code ec;
+        if (fs::is_directory(cache_dir, ec)) {
+          for (fs::directory_iterator it(cache_dir, ec), end; !ec && it != end; it.increment(ec)) {
+            if (path_to_utf8(it->path().filename()).rfind("clip-", 0) == 0) {
+              std::error_code remove_ec;
+              fs::remove_all(it->path(), remove_ec);
+            }
+          }
+        }
+      });
 
       while (true) {
         event_t event;
@@ -380,18 +486,23 @@ namespace clipboard_sync {
           events.pop_front();
         }
 
-        if (std::holds_alternative<hello_event_t>(event)) {
-          send_hello();
-        } else if (auto message = std::get_if<message_event_t>(&event)) {
-          handle_message(message->data);
-        } else if (auto local = std::get_if<local_event_t>(&event)) {
-          handle_local_change(std::move(local->content));
-        }
+        run_work([&]() {
+          if (std::holds_alternative<hello_event_t>(event)) {
+            send_hello();
+          } else if (auto message = std::get_if<message_event_t>(&event)) {
+            handle_message(message->data);
+          } else if (auto local = std::get_if<local_event_t>(&event)) {
+            handle_local_change(std::move(local->content));
+          }
+        });
 
-        busy_flag = fetch.has_value();
+        fetch_active = fetch.has_value();
+        unfinished_events--;
       }
 
-      cancel_fetch();
+      run_work([this]() {
+        cancel_fetch();
+      });
     }
 
     void send_hello() {
@@ -674,7 +785,8 @@ namespace clipboard_sync {
         return;
       }
 
-      length = std::min(length, total_size - offset);
+      // Ranges are served all at once, so they're bounded like the ones this engine requests
+      length = std::min({length, total_size - offset, REQUEST_SIZE});
       if (file.is_open()) {
         file.seekg((std::streamoff) offset);
       }
@@ -683,6 +795,10 @@ namespace clipboard_sync {
       std::vector<uint8_t> chunk;
       uint64_t sent = 0;
       do {
+        if (stopping) {
+          return;
+        }
+
         auto n = (size_t) std::min<uint64_t>(chunk_size, length - sent);
         const uint8_t *payload = nullptr;
         if (memory) {
@@ -704,6 +820,8 @@ namespace clipboard_sync {
         send(w);
         sent += n;
       } while (sent < length);
+
+      last_served = std::chrono::steady_clock::now().time_since_epoch().count();
     }
 
     void handle_announce(reader_t &r) {
@@ -911,6 +1029,11 @@ namespace clipboard_sync {
 
       bool request_done = last || request.received == request.length || item.received == item.size;
       if (request_done) {
+        // Ranges only end early at the end of their item
+        if (request.offset + request.received != std::min(request.offset + request.length, item.size)) {
+          abort_fetch("the remote side sent an incomplete range");
+          return;
+        }
         f.requests.erase(request_it);
         if (item.requested > item.size) {
           // The first request of an item of unknown size asked for more than it has
@@ -1056,10 +1179,12 @@ namespace clipboard_sync {
     std::thread thread;
     std::mutex mutex;
     std::condition_variable cv;
-    bool stopping = false;
+    std::atomic<bool> stopping {false};
     std::deque<event_t> events;
     std::atomic<bool> active_flag {false};
-    std::atomic<bool> busy_flag {false};
+    std::atomic<ptrdiff_t> unfinished_events {0};  ///< Queued events, and the one being handled.
+    std::atomic<bool> fetch_active {false};
+    std::atomic<std::chrono::steady_clock::rep> last_served {0};  ///< When a request was last served.
 
     // Everything below is only used by the engine thread
     bool hello_sent = false;
@@ -1098,7 +1223,7 @@ namespace clipboard_sync {
   }
 
   bool engine_t::busy() const {
-    return impl->busy_flag;
+    return impl->busy();
   }
 
 }  // namespace clipboard_sync

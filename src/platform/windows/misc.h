@@ -60,4 +60,10 @@ namespace platf {
    * @return The user's token, which the caller must close, or `nullptr` on error.
    */
   HANDLE retrieve_users_token(bool elevated);
+
+  /**
+   * @brief Check if the current process is running with system-level privileges.
+   * @return `true` if the current process has system-level privileges, `false` otherwise.
+   */
+  bool is_running_as_system();
 }  // namespace platf

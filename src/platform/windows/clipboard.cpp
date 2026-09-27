@@ -19,12 +19,14 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincodec.h>
+#include <WtsApi32.h>
 // clang-format on
 
 // local includes
 #include "misc.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/utility.h"
 #include "utf_utils.h"
 
 using namespace std::literals;
@@ -41,6 +43,24 @@ namespace platf {
 
     // Largest clipboard image that is synced
     constexpr size_t MAX_IMAGE_SIZE = 64 << 20;
+
+    // The user's token is looked up again after this, in case they logged off
+    constexpr auto USER_TOKEN_LIFETIME = 5s;
+
+    /**
+     * @brief Check whether a copied path is a file system path, rather than a device.
+     */
+    bool is_file_system_path(const std::wstring &path) {
+      // Win32 namespace paths are only allowed for drive letters and UNC shares
+      if (path.rfind(LR"(\\.\)", 0) == 0) {
+        return false;
+      }
+      if (path.rfind(LR"(\\?\)", 0) == 0) {
+        auto rest = path.substr(4);
+        return rest.rfind(LR"(UNC\)", 0) == 0 || (rest.size() >= 3 && iswalpha(rest[0]) && rest[1] == L':' && rest[2] == L'\\');
+      }
+      return true;
+    }
 
     /**
      * @brief Minimal owning COM pointer.
@@ -168,7 +188,7 @@ namespace platf {
       win_clipboard_t() {
         png_format = RegisterClipboardFormatW(L"PNG");
         drop_effect_format = RegisterClipboardFormatW(L"Preferred DropEffect");
-        cache = find_cache_dir();
+        running_as_system = is_running_as_system();
 
         std::promise<bool> started;
         auto started_future = started.get_future();
@@ -203,40 +223,83 @@ namespace platf {
         PostMessageW(hwnd, WM_APP_SET_CLIPBOARD, 0, 0);
       }
 
-      fs::path cache_dir() override {
-        return cache;
-      }
-
-    private:
       /**
-       * @brief Find a directory for received files that the desktop user can read.
+       * @brief Find the directory for received files of the desktop user.
        *
-       * Sunshine runs as SYSTEM, but files are pasted by the user's applications, so they're stored
-       * in the user's own temporary directory, which other users can't read.
+       * Files are pasted by the user's applications, so they're stored in the user's own temporary
+       * directory, which other users can't read.
        */
-      static fs::path find_cache_dir() {
+      fs::path cache_dir() override {
         fs::path path;
 
-        if (auto token = retrieve_users_token(false)) {
+        if (auto token = user_token()) {
           PWSTR local_app_data = nullptr;
-          if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, token, &local_app_data))) {
+          if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, token.get(), &local_app_data))) {
             path = fs::path(local_app_data) / L"Temp" / L"Sunshine Clipboard";
-            CoTaskMemFree(local_app_data);
           }
-          CloseHandle(token);
+          CoTaskMemFree(local_app_data);
+        } else if (!running_as_system) {
+          std::error_code ec;
+          path = fs::temp_directory_path(ec) / L"Sunshine Clipboard";
         }
 
+        // Nobody is logged on. Only the user may write files, so files aren't received then.
         if (path.empty()) {
           path = appdata() / "clipboard";
         }
 
-        // Files received by earlier runs aren't on the clipboard anymore
-        std::error_code ec;
-        fs::remove_all(path, ec);
-        fs::create_directories(path, ec);
-
-        BOOST_LOG(info) << "Clipboard files are stored in "sv << path.string();
+        BOOST_LOG(debug) << "Clipboard files are stored in "sv << path.string();
         return path;
+      }
+
+      /**
+       * @brief Impersonate the desktop user while running work, since Sunshine runs as SYSTEM.
+       *
+       * Without a logged on user, the work runs as the anonymous user, which can't access files.
+       */
+      void run_as_user(const std::function<void()> &work) override {
+        if (!running_as_system) {
+          work();
+          return;
+        }
+
+        auto token = user_token();
+        if (!(token ? ImpersonateLoggedOnUser(token.get()) : ImpersonateAnonymousToken(GetCurrentThread()))) {
+          BOOST_LOG(error) << "Clipboard: couldn't impersonate the user: "sv << GetLastError();
+          return;
+        }
+        auto revert = util::fail_guard([]() {
+          RevertToSelf();
+        });
+
+        work();
+      }
+
+    private:
+      /**
+       * @brief Get the token of the user logged on at the console.
+       * @return The token, or nullptr if nobody is logged on or Sunshine doesn't run as SYSTEM.
+       */
+      std::shared_ptr<void> user_token() {
+        if (!running_as_system) {
+          return nullptr;
+        }
+
+        auto session_id = WTSGetActiveConsoleSessionId();
+        auto now = std::chrono::steady_clock::now();
+
+        std::lock_guard lg(token_mutex);
+        if (session_id != token_session_id || now - token_time > USER_TOKEN_LIFETIME) {
+          cached_token.reset();
+          token_session_id = session_id;
+          token_time = now;
+
+          HANDLE handle;
+          if (session_id != 0xFFFFFFFF && WTSQueryUserToken(session_id, &handle)) {
+            cached_token = std::shared_ptr<void>(handle, CloseHandle);
+          }
+        }
+        return cached_token;
       }
 
       void run(std::promise<bool> started) {
@@ -364,7 +427,9 @@ namespace platf {
               auto length = DragQueryFileW(drop, i, nullptr, 0);
               std::wstring path(length, L'\0');
               DragQueryFileW(drop, i, path.data(), length + 1);
-              content.files.emplace_back(path);
+              if (is_file_system_path(path)) {
+                content.files.emplace_back(path);
+              }
             }
           }
         }
@@ -589,8 +654,13 @@ namespace platf {
       std::thread thread;
       UINT png_format = 0;
       UINT drop_effect_format = 0;
-      fs::path cache;
+      bool running_as_system = false;
       com_ptr<IWICImagingFactory> wic;
+
+      std::mutex token_mutex;
+      std::shared_ptr<void> cached_token;
+      DWORD token_session_id = 0xFFFFFFFF;
+      std::chrono::steady_clock::time_point token_time;
 
       std::mutex listeners_mutex;
       std::map<int, listener_t> listeners;

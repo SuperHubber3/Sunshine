@@ -267,5 +267,127 @@ TEST_P(ClipboardSyncHostilePathTest, IsRejected) {
 INSTANTIATE_TEST_SUITE_P(
   ClipboardSyncTests,
   ClipboardSyncHostilePathTest,
-  testing::Values("../evil", "a/../../evil", "/abs", "C:evil", "a\\b", "a//b", "a/./b", "dot.", "", "a/")
+  testing::Values(
+    "../evil",
+    "a/../../evil",
+    "/abs",
+    "C:evil",
+    "a\\b",
+    "a//b",
+    "a/./b",
+    "dot.",
+    "",
+    "a/",
+    // Invalid UTF-8: a stray continuation byte, an overlong '/', a surrogate, and a truncated sequence
+    "\xff",
+    "a\xc0\xafb",
+    "\xed\xa0\x80",
+    "a\xe2\x82"
+#ifdef _WIN32
+    ,
+    // Device names
+    "NUL",
+    "dir/com1.txt",
+    "Lpt9",
+    "CON .txt"
+#endif
+  )
 );
+
+namespace {
+  /**
+   * @brief Find the messages of a type that one side sent.
+   */
+  std::vector<std::vector<uint8_t>> sent_messages(side_t &side, uint8_t type) {
+    std::lock_guard lg(side.mutex);
+    std::vector<std::vector<uint8_t>> result;
+    for (auto &message : side.sent) {
+      if (message[0] == type) {
+        result.push_back(message);
+      }
+    }
+    return result;
+  }
+
+  uint64_t read_number(const std::vector<uint8_t> &message, size_t offset, int size) {
+    uint64_t value = 0;
+    for (int i = 0; i < size; i++) {
+      value |= (uint64_t) message[offset + i] << (8 * i);
+    }
+    return value;
+  }
+}  // namespace
+
+class ClipboardSyncPeerTest: public BaseTest {
+protected:
+  void SetUp() override {
+    BaseTest::SetUp();
+    root = fs::temp_directory_path() / "sunshine-clipboard-sync-peer";
+    fs::remove_all(root);
+    engine.create(root / "cache");
+
+    auto hello = raw_message_t(1).number(1, 4).number(0xffffffff, 4).number(1ull << 40, 8);
+    engine.engine->on_message(hello.bytes.data(), hello.bytes.size());
+  }
+
+  void TearDown() override {
+    engine.engine.reset();
+    fs::remove_all(root);
+    BaseTest::TearDown();
+  }
+
+  fs::path root;
+  side_t engine;
+};
+
+TEST_F(ClipboardSyncPeerTest, ServedRangesAreBounded) {
+  clipboard_sync::content_t content;
+  content.text = std::string(1 << 20, 'x');
+  engine.engine->on_local_changed(content);
+
+  // Ask for everything at once
+  auto request = raw_message_t(3).number(7, 4).number(1, 4).number(1, 1).number(0, 3).number(0, 4).number(0, 8).number(UINT64_MAX, 8);
+  engine.engine->on_message(request.bytes.data(), request.bytes.size());
+
+  uint64_t served = 0;
+  bool last = false;
+  for (int i = 0; i < 200 && !last; i++) {
+    std::this_thread::sleep_for(10ms);
+    served = 0;
+    for (auto &data : sent_messages(engine, 4)) {
+      if (read_number(data, 4, 4) == 7) {
+        ASSERT_EQ(data[8], 0) << "the request failed";
+        served += data.size() - 28;
+        last = last || data[9] != 0;
+      }
+    }
+  }
+
+  EXPECT_TRUE(last);
+  EXPECT_EQ(served, 256u * 1024);
+}
+
+TEST_F(ClipboardSyncPeerTest, TruncatedRangesAbortTheTransfer) {
+  // Announce 1000 bytes of text
+  auto announce = raw_message_t(2).number(1, 4).number(1, 4).number(1, 1).number(0, 3).number(0, 4).number(1000, 8);
+  engine.engine->on_message(announce.bytes.data(), announce.bytes.size());
+
+  std::vector<std::vector<uint8_t>> requests;
+  for (int i = 0; i < 100 && requests.empty(); i++) {
+    std::this_thread::sleep_for(10ms);
+    requests = sent_messages(engine, 3);
+  }
+  ASSERT_EQ(requests.size(), 1u);
+  auto request_id = read_number(requests[0], 4, 4);
+
+  // Claim the range ends after 10 bytes
+  auto data = raw_message_t(4).number(request_id, 4).number(0, 1).number(1, 1).number(0, 2).number(1000, 8).number(0, 8).text(std::string(10, 'y'));
+  engine.engine->on_message(data.bytes.data(), data.bytes.size());
+
+  for (int i = 0; i < 100 && engine.engine->busy(); i++) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_FALSE(engine.engine->busy());
+  std::lock_guard lg(engine.mutex);
+  EXPECT_TRUE(engine.set_calls.empty());
+}

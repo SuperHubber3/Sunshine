@@ -7,6 +7,7 @@
 // standard includes
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -56,6 +57,12 @@ namespace clipboard {
     bool pop_outgoing(std::vector<uint8_t> &message);
 
     /**
+     * @brief Get the size of the next message to send to the client.
+     * @return Size of the message, or 0 if there's none.
+     */
+    size_t next_outgoing_size();
+
+    /**
      * @brief Check whether messages are waiting or a transfer is in progress.
      * @return True while the control stream should be serviced frequently.
      */
@@ -68,8 +75,10 @@ namespace clipboard {
     int listener_id = -1;
     std::unique_ptr<clipboard_sync::engine_t> engine;
 
+    std::filesystem::path cache_dir;
     std::mutex outgoing_mutex;
     std::deque<std::vector<uint8_t>> outgoing;
+    size_t outgoing_bytes = 0;
   };
 
 }  // namespace clipboard

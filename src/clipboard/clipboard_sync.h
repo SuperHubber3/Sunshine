@@ -90,6 +90,11 @@ namespace clipboard_sync {
 
     /// Log a message. Called from any thread.
     std::function<void(log_level_e level, const std::string &message)> log;
+
+    /// Run engine work, which may access files, with the access rights of the desktop user. Owners that
+    /// run with more privileges than the user impersonate them here. Work that isn't run is dropped.
+    /// Called from the engine thread. If unset, work runs directly.
+    std::function<void(const std::function<void()> &work)> run_as_user;
   };
 
   /**

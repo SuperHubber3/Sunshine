@@ -959,6 +959,18 @@ namespace platf {
      * @return Directory readable by the desktop user.
      */
     virtual std::filesystem::path cache_dir() = 0;
+
+    /**
+     * @brief Run work that accesses files with the access rights of the desktop user.
+     *
+     * Clipboard files are chosen by the user and remote clients, so they must never be accessed
+     * with the more powerful rights Sunshine may run with.
+     *
+     * @param work Work to run on the calling thread. It isn't run if the rights can't be dropped.
+     */
+    virtual void run_as_user(const std::function<void()> &work) {
+      work();
+    }
   };
 
   /**
