@@ -1,0 +1,154 @@
+---
+# Builds Windows installers of this fork, which adds the PyroWave encoder and clipboard sync.
+# PyroWave is built from source since it isn't packaged anywhere.
+name: Sunlight-Windows
+permissions: {}
+
+on:
+  push:
+    branches:
+      - pyrowave
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.14'
+  PYROWAVE_REPOSITORY: SuperHubber3/pyrowave
+  PYROWAVE_REF: pyrowave
+
+jobs:
+  build_windows:
+    name: Windows-AMD64
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Checkout PyroWave
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ env.PYROWAVE_REPOSITORY }}
+          ref: ${{ env.PYROWAVE_REF }}
+          path: pyrowave
+
+      - name: Setup Dependencies Windows
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
+        with:
+          msystem: ucrt64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-nsis
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-qt6-static
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Setup dotnet  # needed for wix
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
+        with:
+          dotnet-version: '10.x'
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 'lts/*'
+
+      - name: NodeJS Path
+        shell: pwsh
+        run: |
+          $NODEJS_PATH = Split-Path -Path (Get-Command node).Source -Parent
+          echo "NODEJS_PATH=$NODEJS_PATH" >> $env:GITHUB_ENV
+
+      - name: Setup python
+        id: setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Sync Python tools
+        env:
+          MSYS2_PATH_TYPE: inherit
+          UV_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+        run: uv sync --locked --no-python-downloads --no-install-project
+
+      - name: Build PyroWave
+        working-directory: pyrowave
+        run: |
+          bash checkout_granite.sh
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/pyrowave-install"
+          ninja -C build install
+
+          # Sunshine needs the Vulkan headers PyroWave was built against
+          cp -r Granite/third_party/khronos/vulkan-headers/include/vulkan \
+            Granite/third_party/khronos/vulkan-headers/include/vk_video \
+            "$GITHUB_WORKSPACE/pyrowave-install/include/"
+
+      - name: Build Windows
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
+          export PATH="$PATH:$NODEJS_PATH"
+
+          cmake \
+            -B build \
+            -G Ninja \
+            -S . \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DPYROWAVE_ROOT="$GITHUB_WORKSPACE/pyrowave-install" \
+            -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues"
+          echo "::add-matcher::.github/matchers/gcc.json"
+          ninja -C build
+          echo "::remove-matcher owner=gcc::"
+
+          # The PyroWave encoder must have been built in
+          grep -q 'SUNSHINE_BUILD_PYROWAVE' build/build.ninja
+
+      - name: Run tests
+        working-directory: build/tests
+        run: ./test_sunshine.exe --gtest_color=yes --gtest_filter='ClipboardSync*:ConfigConsistency*'
+
+      - name: Package Windows
+        run: |
+          mkdir -p artifacts
+          cd build
+          cpack -G WIX
+          cpack -G ZIP
+          mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-PyroWave-Windows-AMD64-installer.msi
+          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-PyroWave-Windows-AMD64-portable.zip
+
+      - name: Debug wix
+        if: always()
+        run: cat ./build/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log || true
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sunshine-pyrowave-windows
+          path: artifacts/
+          if-no-files-found: error
