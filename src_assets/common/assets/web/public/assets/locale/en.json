@@ -336,6 +336,8 @@
     "mouse_desc": "Allows guests to control the host system with the mouse",
     "native_pen_touch": "Native Pen/Touch Support",
     "native_pen_touch_desc": "When enabled, Sunshine will pass through native pen/touch events from Moonlight clients. This can be useful to disable for older applications without native pen/touch support.",
+    "clipboard": "Clipboard Sync",
+    "clipboard_desc": "When enabled, the clipboard (text, images and files) is synced both ways with Moonlight clients that support it. Only enable this for clients you trust with your clipboard contents.",
     "notify_pre_releases": "PreRelease Notifications",
     "notify_pre_releases_desc": "Whether to be notified of new pre-release versions of Sunshine",
     "nvenc_h264_cavlc": "Prefer CAVLC over CABAC in H.264",

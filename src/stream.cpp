@@ -23,6 +23,7 @@ extern "C" {
 }
 
 // local includes
+#include "clipboard/clipboard.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
@@ -53,6 +54,7 @@ constexpr int IDX_SET_MOTION_EVENT = 13;  ///< Control-stream message index for 
 constexpr int IDX_SET_RGB_LED = 14;  ///< Control-stream message index for set rgb led.
 constexpr int IDX_SET_ADAPTIVE_TRIGGERS = 15;  ///< Control-stream message index for set adaptive triggers.
 constexpr int IDX_SET_PLAYER_LEDS = 16;  ///< Control-stream message index for set player indicator LEDs.
+constexpr int IDX_CLIPBOARD = 17;  ///< Control-stream message index for clipboard sync.
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -72,7 +74,9 @@ static const short packetTypes[] = {
   0x5502,  // Set RGB LED (Sunshine protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
   0x5504,  // Set player indicator LEDs (Sunshine protocol extension)
+  0x5505,  // Clipboard sync (Sunshine protocol extension)
 };
+
 
 namespace asio = boost::asio;
 namespace sys = boost::system;
@@ -431,11 +435,17 @@ namespace stream {
      *
      * @param payload Optional payload body to include in the response.
      * @param peer Remote endpoint associated with the socket.
+     * @param channel ENet channel to send on.
      * @return Network operation status.
      */
-    int send(const std::string_view &payload, net::peer_t peer) {
+    int send(const std::string_view &payload, net::peer_t peer, std::uint8_t channel = 0) {
+      // Clients may support fewer channels than we use
+      if (channel >= peer->channelCount) {
+        channel = 0;
+      }
+
       auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE);
-      if (enet_peer_send(peer, 0, packet)) {
+      if (enet_peer_send(peer, channel, packet)) {
         enet_packet_destroy(packet);
 
         return -1;
@@ -548,6 +558,7 @@ namespace stream {
 
       platf::feedback_queue_t feedback_queue;  ///< Queue of controller feedback awaiting control-channel delivery.
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;  ///< Queue of HDR metadata awaiting control-channel delivery.
+      std::unique_ptr<clipboard::session_t> clipboard;  ///< Clipboard sync, created when the client asks for it.
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
@@ -1157,6 +1168,33 @@ namespace stream {
   }
 
   /**
+   * @brief Send a clipboard sync message to the client.
+   *
+   * @param session Active streaming or pairing session for the request.
+   * @param message Clipboard message.
+   * @return 0 on success.
+   */
+  int send_clipboard(session_t *session, const std::vector<uint8_t> &message) {
+    std::vector<std::uint8_t> plaintext(sizeof(control_header_v2) + message.size());
+    auto header = (control_header_v2 *) plaintext.data();
+    header->type = packetTypes[IDX_CLIPBOARD];
+    header->payloadLength = (std::uint16_t) message.size();
+    std::copy(message.begin(), message.end(), plaintext.begin() + sizeof(control_header_v2));
+
+    static thread_local std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_header_v2) + LI_CLIPBOARD_MESSAGE_MAX) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, std::string_view {(char *) plaintext.data(), plaintext.size()}, encrypted_payload);
+    // Clipboard messages have their own channel, so large transfers never delay other control messages
+    if (payload.empty() || session->broadcast_ref->control_server.send(payload, session->control.peer, CTRL_CHANNEL_CLIPBOARD)) {
+      BOOST_LOG(warning) << "Couldn't send clipboard message"sv;
+      return -1;
+    }
+
+    return 0;
+  }
+
+  /**
    * @brief Run the broadcast control-channel worker thread.
    *
    * @param server RTSP server instance handling the request.
@@ -1233,6 +1271,25 @@ namespace stream {
       }
 
       input::passthrough(session->input, std::move(plaintext));
+    });
+
+    server->map(packetTypes[IDX_CLIPBOARD], [](session_t *session, const std::string_view &payload) {
+      // Clipboard contents must never travel unencrypted
+      if (session->config.controlProtocolType != 13) {
+        BOOST_LOG(warning) << "Ignoring clipboard message on an unencrypted control stream"sv;
+        return;
+      }
+
+      // Clipboard sync starts when the client says HELLO
+      if (!session->control.clipboard) {
+        session->control.clipboard = clipboard::session_t::create();
+        if (!session->control.clipboard) {
+          BOOST_LOG(debug) << "Ignoring clipboard message, clipboard sync is disabled"sv;
+          return;
+        }
+      }
+
+      session->control.clipboard->on_message(payload);
     });
 
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
@@ -1312,6 +1369,7 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
+      bool clipboard_busy = false;
 
       {
         auto lg = server->_sessions.lock();
@@ -1367,6 +1425,14 @@ namespace stream {
 
               send_hdr_mode(session, std::move(hdr_info));
             }
+
+            if (session->control.clipboard) {
+              std::vector<uint8_t> message;
+              while (session->control.clipboard->pop_outgoing(message)) {
+                send_clipboard(session, message);
+              }
+              clipboard_busy = clipboard_busy || session->control.clipboard->busy();
+            }
           }
 
           ++pos;
@@ -1379,7 +1445,9 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      // Service the control stream frequently while clipboard contents are being transferred,
+      // since queued messages are only sent between iterations
+      server->iterate(clipboard_busy ? 1ms : 150ms);
     }
 
     // Let all remaining connections know the server is shutting down

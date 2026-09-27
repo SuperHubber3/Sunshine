@@ -22,6 +22,7 @@ extern "C" {
 #include <boost/bind.hpp>
 
 // local includes
+#include "clipboard/clipboard.h"
 #include "config.h"
 #include "globals.h"
 #include "input.h"
@@ -925,7 +926,11 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    auto capabilities = (uint32_t) platf::get_capabilities();
+    if (clipboard::supported()) {
+      capabilities |= platf::platform_caps::clipboard;
+    }
+    ss << "a=x-ss-general.featureFlags:" << capabilities << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;

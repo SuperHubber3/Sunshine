@@ -273,6 +273,14 @@ namespace platf {
   }
 
   /**
+   * @brief Clipboard sync isn't implemented on this platform.
+   * @return nullptr.
+   */
+  std::shared_ptr<clipboard_t> clipboard() {
+    return nullptr;
+  }
+
+  /**
    * @brief Performs migration if necessary, then returns the appdata directory.
    * @details This is used for the log directory, so it cannot invoke Boost logging!
    * @return The path of the appdata directory that should be used.

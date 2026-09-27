@@ -22,6 +22,7 @@
 #ifndef _WIN32
   #include "src/boost_process_compat.h"
 #endif
+#include "src/clipboard/clipboard_sync.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/thread_safe.h"
@@ -406,6 +407,10 @@ namespace platf {
      * @brief Capability bit indicating controller touchpad and motion support.
      */
     constexpr caps_t controller_touch = 0x02;  // Controller touch and motion events
+    /**
+     * @brief Capability bit indicating clipboard sync support.
+     */
+    constexpr caps_t clipboard = 0x04;  // Clipboard sync messages
   };  // namespace platform_caps
 
   /**
@@ -914,6 +919,53 @@ namespace platf {
   using input_t = util::safe_ptr<input_raw_t, &freeInput>;
 
   std::filesystem::path appdata();
+
+  /**
+   * @brief The desktop clipboard, shared by all streaming sessions.
+   */
+  class clipboard_t {
+  public:
+    /**
+     * @brief Callback for changes of the clipboard made by local applications.
+     */
+    using listener_t = std::function<void(const clipboard_sync::content_t &content)>;
+
+    virtual ~clipboard_t() = default;
+
+    /**
+     * @brief Start reporting clipboard changes to a listener. Called from the listener's owner thread.
+     *
+     * @param listener Callback, invoked on the clipboard thread.
+     * @return Identifier to pass to remove_listener().
+     */
+    virtual int add_listener(listener_t listener) = 0;
+
+    /**
+     * @brief Stop reporting clipboard changes. Returns once the listener can't be invoked anymore.
+     *
+     * @param id Identifier returned by add_listener().
+     */
+    virtual void remove_listener(int id) = 0;
+
+    /**
+     * @brief Replace the clipboard contents. Files must remain available until they're replaced.
+     *
+     * @param content New contents.
+     */
+    virtual void set(const clipboard_sync::content_t &content) = 0;
+
+    /**
+     * @brief Return the directory where files received from clients are stored for pasting.
+     * @return Directory readable by the desktop user.
+     */
+    virtual std::filesystem::path cache_dir() = 0;
+  };
+
+  /**
+   * @brief Return the desktop clipboard.
+   * @return Shared clipboard, or nullptr if clipboard sync isn't supported on this platform.
+   */
+  std::shared_ptr<clipboard_t> clipboard();
 
   /**
    * @brief Return the hardware MAC address associated with a network address.

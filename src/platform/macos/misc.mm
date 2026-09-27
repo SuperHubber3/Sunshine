@@ -67,6 +67,14 @@ namespace platf {
 
   // Return whether screen capture is allowed for this process.
   /**
+   * @brief Clipboard sync isn't implemented on this platform.
+   * @return nullptr.
+   */
+  std::shared_ptr<clipboard_t> clipboard() {
+    return nullptr;
+  }
+
+  /**
    * @brief Check whether screen capture allowed.
    */
   bool is_screen_capture_allowed() {

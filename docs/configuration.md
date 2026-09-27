@@ -771,6 +771,32 @@ supported on the current platform.
     </tr>
 </table>
 
+
+### clipboard
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sync the clipboard (text, images and files) in both directions with Moonlight clients that support it.
+            <br>
+            Clipboard contents are only sent over the encrypted control stream. Only enable this for clients you trust with your clipboard.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            clipboard = disabled
+            @endcode</td>
+    </tr>
+</table>
+
 ## Audio/Video
 
 ### audio_sink

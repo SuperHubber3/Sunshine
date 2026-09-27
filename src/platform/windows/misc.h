@@ -52,4 +52,12 @@ namespace platf {
    * @return true if version info was successfully extracted, false otherwise.
    */
   bool getFileVersionInfo(const std::filesystem::path &file_path, std::string &version_str);
+
+  /**
+   * @brief Obtain the primary token of the user logged in at the console.
+   *
+   * @param elevated Whether the token should be elevated if the user is an administrator.
+   * @return The user's token, which the caller must close, or `nullptr` on error.
+   */
+  HANDLE retrieve_users_token(bool elevated);
 }  // namespace platf

@@ -309,6 +309,7 @@ namespace config {
 
     bool high_resolution_scrolling;  ///< Enable high-resolution mouse-wheel events.
     bool native_pen_touch;  ///< Enable native pen and touch injection.
+    bool clipboard;  ///< Sync the clipboard with clients that support it.
   };
 
   namespace flag {

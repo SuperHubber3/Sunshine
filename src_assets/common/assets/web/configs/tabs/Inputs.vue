@@ -367,6 +367,14 @@ watch(
               v-model="config.native_pen_touch"
               default="true"
     ></Checkbox>
+
+    <!-- Clipboard sync -->
+    <Checkbox class="mb-3"
+              id="clipboard"
+              locale-prefix="config"
+              v-model="config.clipboard"
+              default="true"
+    ></Checkbox>
   </div>
 </template>
 
