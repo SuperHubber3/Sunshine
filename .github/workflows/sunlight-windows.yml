@@ -48,7 +48,10 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-cppwinrt
             mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-doxygen
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-graphviz
+            mingw-w64-ucrt-x86_64-libtiff
             mingw-w64-ucrt-x86_64-miniupnpc
             mingw-w64-ucrt-x86_64-MinHook
             mingw-w64-ucrt-x86_64-ninja
@@ -116,6 +119,7 @@ jobs:
             -B build \
             -G Ninja \
             -S . \
+            -DBUILD_DOCS=OFF \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DSUNSHINE_ASSETS_DIR=assets \
             -DPYROWAVE_ROOT="$GITHUB_WORKSPACE/pyrowave-install" \
@@ -129,9 +133,39 @@ jobs:
           # The PyroWave encoder must have been built in
           grep -q 'SUNSHINE_BUILD_PYROWAVE' build/build.ninja
 
+      - name: Check Windows linkage
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath "$GITHUB_WORKSPACE")/pyrowave-install/bin:$PATH"
+
+          # Only system DLLs and the ones shipped next to sunshine.exe may be loaded
+          unexpected=""
+          for binary in build/sunshine.exe build/tools/sunshinesvc.exe pyrowave-install/bin/libpyrowave-shared*.dll; do
+            echo "::group::ldd ${binary}"
+            linkage="$(ldd "${binary}")"
+            echo "${linkage}"
+            echo "::endgroup::"
+            unexpected+="$(echo "${linkage}" | awk '
+              BEGIN { IGNORECASE = 1 }
+              $1 == "zlib1.dll" { next }
+              $1 ~ /^minhook-detours\..*\.dll$/ { next }
+              $1 ~ /^libpyrowave-shared.*\.dll$/ { next }
+              $0 ~ /=>[[:space:]]+not found/ { print }
+              $0 ~ /=>[[:space:]]+\/(clangarm64|clang64|mingw32|mingw64|ucrt64)\/bin\// { print }
+              $0 ~ /=>[[:space:]]+\/[a-z]\/a\// { print }
+            ')"
+          done
+          if [ -n "${unexpected}" ]; then
+            echo "::error::Unexpected DLL dependencies:"
+            echo "${unexpected}"
+            exit 1
+          fi
+
       - name: Run tests
         working-directory: build/tests
-        run: ./test_sunshine.exe --gtest_color=yes --gtest_filter='ClipboardSync*:ConfigConsistency*'
+        run: |
+          export PATH="$(cygpath "$GITHUB_WORKSPACE")/pyrowave-install/bin:$PATH"
+          ./test_sunshine.exe --gtest_color=yes --gtest_filter='ClipboardSync*:ConfigConsistency*'
 
       - name: Package Windows
         run: |
