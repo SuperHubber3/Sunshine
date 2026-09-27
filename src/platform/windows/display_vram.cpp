@@ -1343,7 +1343,7 @@ namespace platf::dxgi {
      * @param adapter_p Adapter that owns the capture textures.
      * @return True on success.
      */
-    bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p) {
+    bool init_device(std::shared_ptr<display_base_t> display, adapter_t::pointer adapter_p) {
       this->display = std::move(display);
 
       D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_1;
@@ -1534,7 +1534,7 @@ namespace platf::dxgi {
     bool create_input(DXGI_FORMAT format) {
       auto vk_format = vk_format_from_dxgi(format);
       if (vk_format == VK_FORMAT_UNDEFINED) {
-        BOOST_LOG(error) << "PyroWave can't encode capture format "sv << dxgi_format_to_string(format);
+        BOOST_LOG(error) << "PyroWave can't encode capture format "sv << display->dxgi_format_to_string(format);
         return false;
       }
 
@@ -1587,28 +1587,28 @@ namespace platf::dxgi {
         return false;
       }
 
-      VkImageCreateInfo info {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-      info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-      info.imageType = VK_IMAGE_TYPE_2D;
-      info.format = vk_format;
-      info.extent = {(uint32_t) input_width, (uint32_t) input_height, 1};
-      info.mipLevels = 1;
-      info.arrayLayers = 1;
-      info.samples = VK_SAMPLE_COUNT_1_BIT;
-      info.tiling = VK_IMAGE_TILING_OPTIMAL;
-      info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-      info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-      info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      VkImageCreateInfo image_info {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      image_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      image_info.imageType = VK_IMAGE_TYPE_2D;
+      image_info.format = vk_format;
+      image_info.extent = {(uint32_t) input_width, (uint32_t) input_height, 1};
+      image_info.mipLevels = 1;
+      image_info.arrayLayers = 1;
+      image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+      image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+      image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
       // PyroWave closes the handle on a successful import. A failed import might leave it open,
       // which leaks one handle, but closing it could double-close a recycled handle value.
-      image_index = encoder.import_image((pyrowave_os_handle) handle, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, info);
+      image_index = encoder.import_image((pyrowave_os_handle) handle, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, image_info);
       if (image_index < 0) {
         return false;
       }
 
       input_format = format;
-      BOOST_LOG(info) << "PyroWave input: "sv << dxgi_format_to_string(format) << ' ' << input_width << 'x' << input_height
+      BOOST_LOG(info) << "PyroWave input: "sv << display->dxgi_format_to_string(format) << ' ' << input_width << 'x' << input_height
                       << " -> "sv << width << 'x' << height << (yuv444 ? " 4:4:4"sv : " 4:2:0"sv) << (hdr ? " HDR"sv : " SDR"sv);
       return true;
     }
@@ -1623,7 +1623,7 @@ namespace platf::dxgi {
       std::weak_ptr<const platf::img_t> img_weak;  ///< Captured image lifetime tracked for cache cleanup.
     };
 
-    std::shared_ptr<platf::display_t> display;
+    std::shared_ptr<display_base_t> display;
     device_t device;
     device_ctx_t device_ctx;
     util::safe_ptr<ID3D11Device5, Release<ID3D11Device5>> device5;
