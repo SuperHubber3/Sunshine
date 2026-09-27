@@ -3412,9 +3412,6 @@ namespace video {
   }
 
   int probe_encoders() {
-    // Only a successful probe advertises PyroWave
-    active_pyrowave = false;
-
     if (!allow_encoder_probing()) {
       // Error already logged
       return -1;
@@ -3427,9 +3424,11 @@ namespace video {
       return 0;
     }
 
-    // Restart encoder selection
+    // Restart encoder selection. PyroWave stays advertised while the encoder doesn't change, since it
+    // uses the same capture pipeline, and is only advertised again if this probe succeeds.
     auto previous_encoder = chosen_encoder;
     chosen_encoder = nullptr;
+    active_pyrowave = false;
     active_hevc_mode = config::video.hevc_mode;
     active_av1_mode = config::video.av1_mode;
     last_encoder_probe_supported_ref_frames_invalidation = false;

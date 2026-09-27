@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -448,6 +449,18 @@ namespace safe {
      */
     bool peek() {
       return _continue && !_queue.empty();
+    }
+
+    /**
+     * @brief Check whether any queued item matches a predicate.
+     *
+     * @param pred Predicate called with each queued item while the queue is locked.
+     * @return True if an item matches.
+     */
+    template<class Pred>
+    bool any_of(const Pred &pred) {
+      std::lock_guard lg {_lock};
+      return std::any_of(std::begin(_queue), std::end(_queue), pred);
     }
 
     /**

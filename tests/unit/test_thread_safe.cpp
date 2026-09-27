@@ -15,6 +15,22 @@
 
 static_assert(!std::is_convertible_v<std::uint32_t, safe::queue_t<int>>);
 
+TEST(ThreadSafeQueue, FindsQueuedItems) {
+  safe::queue_t<int> queue;
+  EXPECT_FALSE(queue.any_of([](int) {
+    return true;
+  }));
+
+  queue.raise(1);
+  queue.raise(2);
+  EXPECT_TRUE(queue.any_of([](int value) {
+    return value == 2;
+  }));
+  EXPECT_FALSE(queue.any_of([](int value) {
+    return value == 3;
+  }));
+}
+
 TEST(ThreadSafeQueue, RejectsNewestItemAtCapacity) {
   safe::queue_t<int> queue {1, safe::queue_t<int>::overflow_policy_e::reject};
 

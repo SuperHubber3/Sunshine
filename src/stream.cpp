@@ -1659,6 +1659,15 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+
+      // Every PyroWave frame can be decoded on its own, so when frames queue up because the network
+      // can't keep up, only the newest one is sent. That lowers the frame rate instead of adding latency.
+      if (session->config.monitor.videoFormat == video::VIDEO_FORMAT_ID_PYROWAVE && packets->any_of([session](const video::packet_t &queued) {
+            return queued->channel_data == session;
+          })) {
+        continue;
+      }
+
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
