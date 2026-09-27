@@ -146,7 +146,8 @@ namespace pyrowave {
     info.output_color_space = hdr_ ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     // 16-bit intermediates are required to preserve HDR precision. 8-bit SDR intermediates are dithered.
     info.intermediate_plane_format = hdr_ ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
-    info.ycbcr_chroma_midpoint = 0.5f;
+    // Clients decode SDR into 8-bit planes, where neutral chroma is 128/255, and HDR into 16-bit planes
+    info.ycbcr_chroma_midpoint = hdr_ ? 0.5f : 128.0f / 255.0f;
     info.crop_rect = input.crop ? &*input.crop : nullptr;
 
     // The exporter owns the image between frames, so ownership moves to us and back every frame.
